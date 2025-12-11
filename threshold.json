@@ -1,0 +1,7 @@
+{
+  "mean": 0.5,
+  "std": 0.1,
+  "p95": 0.8,
+  "p99": 1.0,
+  "suggested_threshold": 1.0
+}
