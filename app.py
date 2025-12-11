@@ -1,402 +1,421 @@
-# app.py — BFZDD Streamlit Dashboard (final, safe + robust)
-# Drop-in replacement for your existing app.py
-# - Graceful handling when model is missing
-# - Sidebar upload for ae_model.pth (session-only)
-# - DISABLE_EXECUTION respected
-# - Avoids pyarrow/ArrowTypeError by defensive rendering of small tables
-# - Clear logging for Streamlit Cloud troubleshooting
-
+# app.py - BFZDD Streamlit dashboard (refactored, robust, with diagnostics)
 import os
 import sys
-import glob
 import json
-import tempfile
-import subprocess
-import logging
+import glob
+import time
+from pathlib import Path
+from typing import List
 
 import streamlit as st
-import torch
-import torch.nn as nn
-import numpy as np
 import pandas as pd
 
-# Import model utilities (must exist in repo)
-from model import AuditAutoencoder, load_trace
+# Diagnostics: print to logs so we can inspect runtime file layout on Streamlit Cloud
+print("[DEBUG] APP START")
+print("[DEBUG] process id:", os.getpid())
+print("[DEBUG] cwd:", os.getcwd())
+print("[DEBUG] python:", sys.version.replace('\n', ' '))
+print("[DEBUG] top-level files:")
+try:
+    print("[DEBUG]", os.listdir("."))
+except Exception as e:
+    print("[DEBUG] listdir error:", e)
 
-# ---------------------------
-# Configuration
-# ---------------------------
-MODEL_FILENAME = "ae_model.pth"                # repo model (persistent)
-UPLOADED_MODEL_FILENAME = "ae_model_upload.pth"  # session/uploaded model (transient)
-THRESH_PATH = "threshold.json"
-DATA_DIR = "dataset/traces"
-SCRIPTS_DIR = "dataset/scripts"
-SANDBOX_RUNNER = "sandbox_runner.py"           # used only when DISABLE_EXECUTION is False
-
-# If deploying publicly, set this env var in Streamlit Cloud: DISABLE_EXECUTION=true
+# Safety: check environment switch to disable code execution in public deployments
 DISABLE_EXECUTION = os.environ.get("DISABLE_EXECUTION", "false").lower() in ("1", "true", "yes")
+print(f"[DEBUG] DISABLE_EXECUTION={DISABLE_EXECUTION}")
 
-# Configure logging (write to a file so logs appear in Streamlit Cloud logs)
-LOGFILE = "app_runtime.log"
-logging.basicConfig(filename=LOGFILE, level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+# Constants
+REPO_ROOT = Path(".")
+DATASET_DIR = REPO_ROOT / "dataset"
+TRACES_DIR = DATASET_DIR / "traces"
+SCRIPTS_DIR = DATASET_DIR / "scripts"
+MODEL_FILENAMES = ["ae_model.pth", "./ae_model.pth", str(REPO_ROOT / "ae_model.pth")]
+THRESHOLD_PATH = REPO_ROOT / "threshold.json"
+MAX_LEN = 200
 
-# ---------------------------
-# Helper functions
-# ---------------------------
+# Import model module robustly
+try:
+    import model as model_mod
+    from model import AuditAutoencoder, load_trace
+    print("[DEBUG] Imported model module successfully")
+except Exception as e:
+    model_mod = None
+    AuditAutoencoder = None
+    load_trace = None
+    print("[DEBUG] Could not import model module:", e)
 
-@st.cache_resource
-def _load_model_from_path(path):
-    """Load a model state dict from given path into an AuditAutoencoder and return it.
-    Returns None on failure."""
+
+# Utility: try to load a torch model file path (safe, returns None on failure)
+def try_load_model_from_path(path: str):
+    import torch
     try:
-        model = AuditAutoencoder(vocab_size=100)
+        print(f"[DEBUG] Attempting torch.load -> {path}")
         state = torch.load(path, map_location="cpu")
-        model.load_state_dict(state)
-        model.eval()
-        logging.info(f"Loaded model from {path}")
-        return model
-    except Exception:
-        logging.exception("Failed to load model from %s", path)
+    except Exception as e:
+        print(f"[DEBUG] torch.load failed for {path}: {e}")
         return None
 
-def load_model():
-    """Try in order: uploaded model (session), then repo model (ae_model.pth)."""
-    if os.path.exists(UPLOADED_MODEL_FILENAME):
-        m = _load_model_from_path(UPLOADED_MODEL_FILENAME)
-        if m is not None:
-            return m
-    if os.path.exists(MODEL_FILENAME):
-        m = _load_model_from_path(MODEL_FILENAME)
-        if m is not None:
-            return m
-    return None
-
-def load_thresholds():
-    if not os.path.exists(THRESH_PATH):
+    # Build model if AuditAutoencoder available
+    if AuditAutoencoder is None:
+        print("[DEBUG] AuditAutoencoder not available in model.py, cannot construct model")
         return None
+
+    # Determine vocab size safely
+    vocab = 200
+    if model_mod is not None:
+        if hasattr(model_mod, "estimated_vocab_size"):
+            try:
+                vocab = model_mod.estimated_vocab_size()
+            except Exception:
+                vocab = int(getattr(model_mod, "_next_token_index", 200))
+        else:
+            vocab = int(getattr(model_mod, "_next_token_index", 200))
+
     try:
-        with open(THRESH_PATH) as f:
-            return json.load(f)
-    except Exception:
-        logging.exception("Failed to load thresholds")
-        return None
-
-def score_trace_with_model(model, trace_seq):
-    """Compute per-step CrossEntropyLoss and mean score. Raises on model errors."""
-    if model is None:
-        raise ValueError("Model is None")
-    device = torch.device("cpu")
-    x = torch.LongTensor([trace_seq]).to(device)  # (1, T)
-    with torch.no_grad():
-        out = model(x)  # (1, T, vocab)
-    ce = nn.CrossEntropyLoss(reduction='none')
-    logits = out.squeeze(0)   # (T, vocab)
-    target = x.squeeze(0)    # (T,)
-    losses = ce(logits, target).cpu().numpy()  # (T,)
-    score = float(np.mean(losses))
-    return score, losses
-
-def compute_scores_for_dataset(model):
-    files = sorted(glob.glob(os.path.join(DATA_DIR, "*.json")))
-    rows = []
-    for f in files:
+        model = AuditAutoencoder(vocab_size=vocab)
+        # Attempt load; allow partial load if shapes mismatch
         try:
-            seq = load_trace(f)
-            if model is None:
-                score = None
-            else:
-                score, _ = score_trace_with_model(model, seq)
-            label = "malicious" if "malware" in os.path.basename(f) else "benign"
-            rows.append({"file": os.path.basename(f), "path": f, "score": score, "label": label})
+            model.load_state_dict(state)
         except Exception:
-            logging.exception("Failed scoring dataset file: %s", f)
-            rows.append({"file": os.path.basename(f), "path": f, "score": None, "label": "error"})
-    return pd.DataFrame(rows)
+            print("[DEBUG] full state load failed, attempting partial load / shape-safe load")
+            ms = model.state_dict()
+            for k, v in state.items():
+                if k in ms and ms[k].shape == v.shape:
+                    ms[k] = v
+            model.load_state_dict(ms)
+        model.eval()
+        return model
+    except Exception as e:
+        print(f"[DEBUG] Failed to instantiate or load AuditAutoencoder: {e}")
+        return None
 
-def run_sandbox_script(script_path, output_trace="trace.json"):
-    """Run sandbox_runner.py as a subprocess (blocking). Returns subprocess.CompletedProcess."""
-    cmd = [sys.executable, SANDBOX_RUNNER, script_path, "--output", output_trace]
-    logging.info("Executing sandbox: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    logging.info("Sandbox finished. returncode=%s", proc.returncode)
-    if proc.stdout:
-        logging.info("Sandbox stdout: %s", proc.stdout[:2000])
-    if proc.stderr:
-        logging.info("Sandbox stderr: %s", proc.stderr[:2000])
-    return proc
 
-def safe_show_table(title, rows):
-    """
-    Safely render a small table/list of dicts without triggering pyarrow ArrowTypeError.
-    - rows: list of dicts
-    """
-    if not rows:
-        st.info(title + ": No entries to show.")
-        return
+# Load thresholds if present
+def load_thresholds():
+    if THRESHOLD_PATH.exists():
+        try:
+            with open(THRESHOLD_PATH, "r") as f:
+                data = json.load(f)
+            print("[DEBUG] Thresholds loaded:", data)
+            return data
+        except Exception as e:
+            print("[DEBUG] Failed to load threshold.json:", e)
+            return {}
+    else:
+        print("[DEBUG] threshold.json not found")
+        return {}
+
+
+# Score a single trace sequence using the model.
+# returns (avg_loss, per_token_losses_list)
+def score_sequence_with_model(model, seq_tokens: List[int]):
+    import torch
+    import torch.nn as nn
+    if model is None:
+        raise RuntimeError("Model is None")
+
+    # Ensure tensor shape (1, T)
+    x = torch.LongTensor([seq_tokens])
+    with torch.no_grad():
+        out = model(x)  # expected (B, T, V)
+        B, T, V = out.shape
+        # cross-entropy expects (N, V) and targets (N,)
+        logits = out.view(B * T, V)
+        targets = x.view(B * T)
+        criterion = nn.CrossEntropyLoss(reduction="none", ignore_index=0)
+        losses = criterion(logits, targets).cpu().numpy()
+        # reshape to (B, T)
+        per_token = losses.reshape(B, T)[0].tolist()
+        avg = float(sum(per_token) / len(per_token)) if len(per_token) > 0 else float("inf")
+        return avg, per_token
+
+
+# Helper to pad/truncate token lists
+def pad_or_truncate(seq, length=MAX_LEN, pad_value=0):
+    if len(seq) >= length:
+        return seq[:length]
+    else:
+        return seq + [pad_value] * (length - len(seq))
+
+
+# Safe wrapper for load_trace(file_path) - returns list of ints and the json-events list (if available)
+def safe_load_trace_and_events(trace_path):
+    # Try to load sequence tokens through load_trace if available
+    events = []
+    seq = []
     try:
-        df = pd.DataFrame(rows)
-        # enforce simple types / limited size to avoid pyarrow conversion issues
-        # convert nested lists/dicts to strings
-        for c in df.columns:
-            if df[c].dtype == object:
-                df[c] = df[c].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else x)
-        st.dataframe(df)
+        # if the trace file is JSON of events, load to get events mapping
+        with open(trace_path, "r") as f:
+            events = json.load(f)
     except Exception:
-        logging.exception("Failed to render anomalous events table")
-        st.write("Could not render table — showing raw items:")
-        for r in rows:
-            st.write(r)
+        events = []
 
-# ---------------------------
+    # Try to call load_trace() (model.py)
+    if load_trace is not None:
+        try:
+            seq_raw = load_trace(str(trace_path))
+            # convert sequences to plain python ints list
+            if hasattr(seq_raw, "tolist"):
+                seq = list(seq_raw.tolist())
+            elif isinstance(seq_raw, (list, tuple)):
+                seq = list(map(int, seq_raw))
+            else:
+                seq = list(map(int, seq_raw))
+        except TypeError:
+            # maybe load_trace needs different args; try without args or with only path
+            try:
+                seq = list(map(int, load_trace(str(trace_path))))
+            except Exception as e:
+                print("[DEBUG] load_trace call failed:", e)
+                seq = []
+        except Exception as e:
+            print("[DEBUG] load_trace error:", e)
+            seq = []
+    else:
+        print("[DEBUG] load_trace not defined in model.py")
+        seq = []
+
+    return seq, events
+
+
 # Streamlit UI
-# ---------------------------
-st.set_page_config(page_title="BFZDD Dashboard", layout="wide")
+st.set_page_config(layout="wide", page_title="BFZDD — Behaviour-First Zero-Day Detector")
+
 st.title("BFZDD — Behaviour-First Zero-Day Detector")
 st.markdown("**Warning:** Running uploaded scripts executes code. Only run inside an isolated VM. See VM_SAFETY.md")
 
-# Sidebar: model upload & status
+# Sidebar - Model & Environment
 st.sidebar.header("Model & Environment")
 
-# Upload a model (session-only). This is optional and convenient on Streamlit Cloud.
-uploaded_model_file = st.sidebar.file_uploader("Upload ae_model.pth (optional)", type=["pth", "pt"])
-if uploaded_model_file is not None:
-    try:
-        with open(UPLOADED_MODEL_FILENAME, "wb") as out_f:
-            out_f.write(uploaded_model_file.getbuffer())
-        st.sidebar.info("Uploaded model saved for this session.")
-        logging.info("User uploaded model to session.")
-    except Exception:
-        logging.exception("Failed to save uploaded model")
-        st.sidebar.error("Failed to save uploaded model (see logs).")
+# Upload model file via sidebar (session only)
+uploaded_model = st.sidebar.file_uploader("Upload ae_model.pth (optional)", type=["pth", "pt"], help="Upload a PyTorch .pth/.pt model file to use for scoring (session-only)")
 
-# Load model (uploaded overrides repo file)
-model = load_model()
+# Show threshold status
 thresholds = load_thresholds()
+st.sidebar.success("Thresholds: Loaded" if thresholds else "Thresholds: Not found")
 
-# Show status
+# Execution policy
+if DISABLE_EXECUTION:
+    st.sidebar.error("Execution: DISABLED (public deployment)")
+else:
+    st.sidebar.info("Execution: ENABLED (local/VM allowed)")
+
+# Attempt to load model
+model = None
+model_source = None
+
+# Priority: uploaded model (session)
+if uploaded_model is not None:
+    # save uploaded file to a local path for loading
+    temp_model_path = "/tmp/ae_model_uploaded.pth"
+    try:
+        with open(temp_model_path, "wb") as out_f:
+            out_f.write(uploaded_model.getbuffer())
+        model = try_load_model_from_path(temp_model_path)
+        if model is not None:
+            model_source = f"uploaded:{temp_model_path}"
+            st.sidebar.success("Model: Loaded (uploaded)")
+        else:
+            st.sidebar.warning("Uploaded model: failed to load")
+    except Exception as e:
+        st.sidebar.error(f"Failed saving uploaded model: {e}")
+
+# Next: try repo root files
+if model is None:
+    for candidate in MODEL_FILENAMES:
+        try:
+            if os.path.exists(candidate):
+                m = try_load_model_from_path(candidate)
+                if m is not None:
+                    model = m
+                    model_source = f"repo:{candidate}"
+                    st.sidebar.success(f"Model: Loaded ({candidate})")
+                    break
+                else:
+                    print(f"[DEBUG] Candidate model {candidate} exists but failed to load")
+            else:
+                print(f"[DEBUG] Candidate model {candidate} does not exist")
+        except Exception as e:
+            print("[DEBUG] error checking candidate", candidate, e)
+
 if model is None:
     st.sidebar.warning("Model: Not found — place ae_model.pth in repo or upload one above.")
 else:
-    st.sidebar.success("Model: Loaded")
+    st.sidebar.success(f"Model source: {model_source}")
 
-if thresholds is None:
-    st.sidebar.warning("Thresholds: Not found")
-else:
-    st.sidebar.success("Thresholds: Loaded")
-
-# Environment flag
-if DISABLE_EXECUTION:
-    st.sidebar.info("Execution: DISABLED (DISABLE_EXECUTION=true) — safe public mode")
-else:
-    st.sidebar.info("Execution: ENABLED (local/VM mode allowed)")
-
-# Main navigation
+# Main UI: Mode selection
 mode = st.sidebar.selectbox("Mode", ["Dataset Review", "Live Analysis", "About & Safety"])
 
-# ---------------------------
-# Dataset Review
-# ---------------------------
-if mode == "Dataset Review":
+if mode == "About & Safety":
+    st.header("About BFZDD")
+    st.write(
+        "Behaviour-First Zero-Day Detector — prototype demo. "
+        "Only run uploaded scripts in an isolated VM. See VM_SAFETY.md for instructions."
+    )
+    st.subheader("Safety & Deployment Notes")
+    st.markdown(
+        "- Local VM only: Run the Streamlit app inside an isolated VM when analyzing unknown scripts.\n"
+        "- Public deployments: set `DISABLE_EXECUTION=true` in the environment so uploaded scripts will not be executed.\n"
+        "- Use snapshots and network isolation for any sandbox runs."
+    )
+
+elif mode == "Dataset Review":
     st.header("Dataset Review")
+    # List traces
+    trace_files = sorted(glob.glob(str(TRACES_DIR / "*.json")))
+    trace_rows = []
+    for t in trace_files:
+        label = "unknown"
+        if "benign" in os.path.basename(t).lower():
+            label = "benign"
+        if "malware" in os.path.basename(t).lower():
+            label = "malicious"
+        trace_rows.append({"file": os.path.basename(t), "path": t, "score": None, "label": label})
+
+    df = pd.DataFrame(trace_rows)
+    st.table(df)
+
     if model is None:
-        st.warning("Model not found. Place ae_model.pth in the repo or upload one via sidebar to enable scoring.")
-    df = compute_scores_for_dataset(model)
-    st.dataframe(df.sort_values(by="score", ascending=False).reset_index(drop=True))
+        st.info("No scores available (no model loaded).")
+    else:
+        # Score all traces
+        st.info("Scoring traces with loaded model (this may take a few seconds)...")
+        results = []
+        for row in trace_rows:
+            path = row["path"]
+            seq, events = safe_load_trace_and_events(path)
+            if not seq:
+                results.append({"file": row["file"], "score": None, "label": row["label"]})
+                continue
+            seq = pad_or_truncate(seq, MAX_LEN)
+            try:
+                score, per_token = score_sequence_with_model(model, seq)
+                results.append({"file": row["file"], "score": float(score), "label": row["label"]})
+            except Exception as e:
+                print("[DEBUG] scoring error for", path, e)
+                results.append({"file": row["file"], "score": None, "label": row["label"]})
 
-    # show distribution where scores exist
-    try:
-        import plotly.express as px
-        if df['score'].notnull().any():
-            fig = px.histogram(df[df['score'].notnull()], x="score", color="label", nbins=40, marginal="box",
-                               title="Reconstruction error distribution")
+        res_df = pd.DataFrame(results)
+        st.table(res_df)
+
+        # Show histogram
+        try:
+            import plotly.express as px
+            fig = px.histogram(res_df, x="score", color="label", nbins=20, title="Reconstruction error distribution")
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No scores available (no model loaded).")
-    except Exception:
-        st.write("Install plotly for nicer charts or view numeric summary.")
-        st.write(df.groupby("label")["score"].describe())
+        except Exception:
+            st.write("Plotly not available; showing simple scores.")
+            st.write(res_df)
 
-# ---------------------------
-# Live Analysis
-# ---------------------------
 elif mode == "Live Analysis":
     st.header("Live Analysis")
     st.markdown("Select an existing script from `dataset/scripts` or upload a script. **DO NOT** run untrusted scripts outside a VM.")
-    col1, col2 = st.columns(2)
 
-    # list available scripts
-    scripts = sorted(glob.glob(os.path.join(SCRIPTS_DIR, "*.py"))) if os.path.exists(SCRIPTS_DIR) else []
-    sel = col1.selectbox("Choose a sample script (from dataset/scripts)", ["--none--"] + [os.path.basename(s) for s in scripts])
-    uploaded = col1.file_uploader("Or upload a Python script (optional)", type=["py"])
+    # choose sample script
+    scripts = sorted(glob.glob(str(SCRIPTS_DIR / "*.py")))
+    script_options = ["--none--"] + [os.path.basename(s) for s in scripts]
+    chosen = st.selectbox("Choose a sample script (from dataset/scripts)", script_options)
 
-    run_in_vm = col1.checkbox("I confirm I will run this only in an isolated VM", value=False)
+    # choose precomputed trace
+    traces = sorted(glob.glob(str(TRACES_DIR / "*.json")))
+    trace_options = ["--none--"] + [os.path.basename(t) for t in traces]
+    chosen_trace = st.selectbox("Or select precomputed trace (dataset/traces)", trace_options)
 
-    # Decide disabling logic
-    exec_disabled = DISABLE_EXECUTION or (model is None)
-    if exec_disabled:
-        if DISABLE_EXECUTION:
-            exec_hint = "Execution disabled by server config (DISABLE_EXECUTION=true)."
-        else:
-            exec_hint = "Model missing: upload ae_model.pth or place it in repo to enable execution."
-        col1.info(exec_hint)
+    upload_file = st.file_uploader("Or upload a Python script (optional)", type=["py"], help="Upload a script to run inside your own VM; do not run untrusted code here.")
 
-    # Buttons
-    execute = col1.button("Run & Analyze (Sandbox)", disabled=exec_disabled)
-    trace_file_list = ["--none--"] + [os.path.basename(p) for p in sorted(glob.glob(os.path.join(DATA_DIR, "*.json")))]
-    trace_file = col2.selectbox("Or select precomputed trace (dataset/traces)", trace_file_list)
-    analyze_trace_btn = col2.button("Analyze selected trace", disabled=(model is None))
+    confirm_vm = st.checkbox("I confirm I will run this only in an isolated VM", value=False)
 
-    # Handle Run & Analyze (sandbox)
-    if execute:
-        # double-check environment safety
-        if DISABLE_EXECUTION:
-            st.error("Execution disabled by server config. Enable execution locally in a VM to run sandbox.")
-        elif not run_in_vm:
-            st.error("You must confirm VM isolation before running scripts.")
-        else:
-            if uploaded is None and sel == "--none--":
-                st.error("No script selected or uploaded.")
-            else:
-                with st.spinner("Running script in sandbox..."):
-                    tmpdir = tempfile.mkdtemp()
-                    if uploaded is not None:
-                        script_path = os.path.join(tmpdir, uploaded.name)
-                        with open(script_path, "wb") as f:
-                            f.write(uploaded.getvalue())
-                    else:
-                        script_path = scripts[[os.path.basename(s) for s in scripts].index(sel)]
-                    trace_out = os.path.join(tmpdir, "trace.json")
+    # diagnostics toggle
+    show_diag = st.checkbox("Show diagnostics (len/events sample)", False)
+
+    # Execution controls
+    can_execute = (not DISABLE_EXECUTION) and confirm_vm
+
+    if not can_execute:
+        st.warning("Execution is disabled (either DISABLE_EXECUTION is true or you have not confirmed VM usage).")
+    else:
+        st.success("Execution allowed: you confirmed and DISABLE_EXECUTION is false.")
+
+    # Score using precomputed trace
+    if st.button("Analyze selected trace"):
+        chosen_path = None
+        if chosen_trace != "--none--":
+            chosen_path = TRACES_DIR / chosen_trace
+        elif chosen != "--none--" and (SCRIPTS_DIR / chosen).exists():
+            # If a script was selected but no trace, we cannot run it here (dangerous).
+            st.warning("No precomputed trace selected. Please run the script in your VM using sandbox_runner.py to produce a trace.json and then upload it here.")
+            chosen_path = None
+        elif upload_file is not None:
+            st.warning("You uploaded a script. Please run it in a VM and upload the produced trace.json instead of running it here.")
+            chosen_path = None
+
+        if chosen_path is not None and model is None:
+            st.error("Model missing: upload ae_model.pth or place it in repo to enable scoring.")
+            chosen_path = None
+
+        if chosen_path is not None and chosen_path.exists():
+            # Score the precomputed trace
+            with st.spinner("Loading and scoring..."):
+                seq, events = safe_load_trace_and_events(str(chosen_path))
+                if not seq:
+                    st.error("Trace parsing failed or trace empty.")
+                else:
+                    seq = pad_or_truncate(seq, MAX_LEN)
                     try:
-                        proc = run_sandbox_script(script_path, output_trace=trace_out)
-                    except Exception:
-                        logging.exception("Sandbox runner invocation failed.")
-                        st.error("Sandbox execution failed. Check app logs.")
-                        proc = None
-
-                    if proc is not None:
-                        if proc.stdout:
-                            st.text("Sandbox stdout:")
-                            st.text(proc.stdout)
-                        if proc.stderr:
-                            st.text("Sandbox stderr:")
-                            st.text(proc.stderr)
-
-                        if os.path.exists(trace_out):
-                            st.success("Trace produced. Loading and scoring...")
-                            try:
-                                seq = load_trace(trace_out)
-                            except Exception:
-                                logging.exception("Failed to load trace produced by sandbox")
-                                st.error("Failed to parse produced trace. See logs.")
-                                seq = None
-
-                            if seq is not None:
-                                try:
-                                    score, losses = score_trace_with_model(model, seq)
-                                except Exception:
-                                    logging.exception("Scoring failed for sandbox trace")
-                                    st.error("Scoring failed. See app logs for details.")
-                                    score, losses = None, None
-
-                                if score is not None:
-                                    st.metric("Anomaly Score", f"{score:.4f}", delta=(score - thresholds.get("mean",0)) if thresholds else None)
-                                    suggested = thresholds.get("suggested_threshold") if thresholds else None
-                                    if suggested and score > suggested:
-                                        st.error(f"Verdict: QUARANTINE (score > {suggested:.4f})")
-                                    else:
-                                        st.success("Verdict: Benign or below threshold")
-
-                                    # top anomalous events
-                                    anomalous = []
-                                    if losses is not None:
-                                        # get top 5 losses indices
-                                        idxs = np.argsort(-losses)[:5]
-                                        try:
-                                            with open(trace_out) as f:
-                                                events = json.load(f)
-                                        except Exception:
-                                            events = []
-                                        for i in idxs:
-                                            if i < len(events):
-                                                anomalous.append({
-                                                    "idx": int(i),
-                                                    "event": events[i].get("event"),
-                                                    "args": events[i].get("args"),
-                                                    "error": float(losses[i])
-                                                })
-                                    # safe display
-                                    st.markdown("### Top anomalous events")
-                                    safe_show_table("Top anomalous events", anomalous)
-                                else:
-                                    st.warning("Score unavailable (scoring error).")
+                        score, per_token = score_sequence_with_model(model, seq)
+                        st.metric("Anomaly Score", f"{score:.4f}")
+                        # verdict
+                        thr = thresholds.get("suggested_threshold")
+                        if thr is not None:
+                            verdict = "QUARANTINE (score > threshold)" if score > float(thr) else "OK (score <= threshold)"
+                            st.error(f"Verdict: {verdict} (threshold = {thr})" if score > float(thr) else f"Verdict: OK (threshold = {thr})")
                         else:
-                            st.error("Trace not produced. Check sandbox logs.")
-    # Handle Analyze selected trace
-    if analyze_trace_btn:
-        if trace_file == "--none--":
-            st.error("No trace selected.")
-        else:
-            trace_path = os.path.join(DATA_DIR, trace_file)
-            try:
-                seq = load_trace(trace_path)
-            except Exception:
-                logging.exception("Failed to load selected trace: %s", trace_path)
-                st.error("Failed to parse selected trace. See logs.")
-                seq = None
+                            st.info("No threshold configured (threshold.json missing).")
 
-            if seq is not None:
-                try:
-                    score, losses = score_trace_with_model(model, seq)
-                except Exception:
-                    logging.exception("Scoring failed for selected trace")
-                    st.error("Scoring failed. See app logs.")
-                    score, losses = None, None
-
-                if score is not None:
-                    st.metric("Anomaly Score", f"{score:.4f}")
-                    suggested = thresholds.get("suggested_threshold") if thresholds else None
-                    if suggested and score > suggested:
-                        st.error(f"Verdict: QUARANTINE (score > {suggested:.4f})")
-                    else:
-                        st.success("Verdict: Benign or below threshold")
-
-                    # prepare anomalous events list
-                    anomalous = []
-                    if losses is not None:
-                        idxs = np.argsort(-losses)[:5]
+                        # Top anomalous events: pick top-k token losses
                         try:
-                            with open(trace_path) as f:
-                                events = json.load(f)
-                        except Exception:
-                            events = []
-                        for i in idxs:
-                            if i < len(events):
-                                anomalous.append({
-                                    "idx": int(i),
-                                    "event": events[i].get("event"),
-                                    "args": events[i].get("args"),
-                                    "error": float(losses[i])
-                                })
-                    st.markdown("### Top anomalous events")
-                    safe_show_table("Top anomalous events", anomalous)
+                            import numpy as np
+                            per_token = list(map(float, per_token))
+                            arr = np.array(per_token)
+                            # top 10 indices
+                            topk = arr.argsort()[-10:][::-1]
+                            rows = []
+                            for idx in topk:
+                                # map index to event if events list is loaded and same length
+                                event_repr = None
+                                if isinstance(events, list) and idx < len(events):
+                                    e = events[idx]
+                                    event_repr = json.dumps(e) if not isinstance(e, str) else str(e)
+                                else:
+                                    event_repr = f"token_index:{idx}"
+                                rows.append({"idx": int(idx), "event": event_repr, "error": float(arr[idx])})
+                            anomalous = pd.DataFrame(rows)
+                            if anomalous.empty:
+                                st.info("Top anomalous events: No entries to show.")
+                            else:
+                                st.subheader("Top anomalous events")
+                                st.table(anomalous)
+                        except Exception as e:
+                            print("[DEBUG] top anomalous events calculation failed:", e)
+                            st.info("Could not compute top anomalous events.")
 
-# ---------------------------
-# About & Safety Page
-# ---------------------------
-elif mode == "About & Safety":
-    st.header("About BFZDD")
-    st.write("Behaviour-First Zero-Day Detector — prototype demo.")
-    st.subheader("Safety & Deployment Notes")
-    st.markdown("""
-    - **Local VM only:** To run scripts, start this Streamlit app inside an isolated VM (VirtualBox/Hyper-V) with networking disabled.
-    - **Public deployments:** If you want to deploy publicly (Streamlit Cloud), set `DISABLE_EXECUTION=true` so uploaded scripts cannot be executed.
-    - See VM_SAFETY.md for step-by-step VM setup.
-    """)
-    st.markdown("### Logs & troubleshooting")
-    st.markdown(f"Application logs (recent) are written to `{LOGFILE}` in the app root. On Streamlit Cloud view 'Manage App -> Logs' to inspect failures.")
+                    except Exception as e:
+                        st.error(f"Scoring failed: {e}")
+        else:
+            st.info("No precomputed trace selected. Pick a trace from the dropdown (dataset/traces) or upload one.")
 
-# Footer: quick status
+
+# Footer diagnostics for quick debugging in UI (not a substitute for logs)
 st.sidebar.markdown("---")
-st.sidebar.write("Model: " + ("Loaded" if model else "Not found"))
-st.sidebar.write("Thresholds: " + ("Loaded" if thresholds else "Not found"))
+st.sidebar.write("Debug / quick info:")
+try:
+    files_here = os.listdir(".")
+    st.sidebar.write(f"Repo files: {files_here[:12]}")
+except Exception as e:
+    st.sidebar.write("Could not list files:", e)
+
+if st.sidebar.checkbox("Show DEBUG log (print)"):
+    st.sidebar.text("Check app logs for [DEBUG] lines (Manage app -> Logs).")
+
+# End of app
