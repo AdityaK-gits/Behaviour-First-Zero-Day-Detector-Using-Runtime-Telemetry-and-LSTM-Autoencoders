@@ -1,11 +1,10 @@
-# app.py — BFZDD Streamlit Dashboard (edited, safer + upload support)
-# Replace your existing app.py with this file.
-# Features added:
-# - Upload ae_model.pth at runtime (session-only) and auto-load
-# - Graceful handling when model is missing (no crashes)
-# - DISABLE_EXECUTION env var respected (safe public deploys)
-# - Friendly messages, logging and protected scoring
-# - Disabled Run & Analyze when dangerous or missing model
+# app.py — BFZDD Streamlit Dashboard (final, safe + robust)
+# Drop-in replacement for your existing app.py
+# - Graceful handling when model is missing
+# - Sidebar upload for ae_model.pth (session-only)
+# - DISABLE_EXECUTION respected
+# - Avoids pyarrow/ArrowTypeError by defensive rendering of small tables
+# - Clear logging for Streamlit Cloud troubleshooting
 
 import os
 import sys
@@ -22,23 +21,22 @@ import numpy as np
 import pandas as pd
 
 # Import model utilities (must exist in repo)
-# model.py must define AuditAutoencoder and load_trace(path)
 from model import AuditAutoencoder, load_trace
 
 # ---------------------------
 # Configuration
 # ---------------------------
-MODEL_FILENAME = "ae_model.pth"          # repo model (persistent)
+MODEL_FILENAME = "ae_model.pth"                # repo model (persistent)
 UPLOADED_MODEL_FILENAME = "ae_model_upload.pth"  # session/uploaded model (transient)
 THRESH_PATH = "threshold.json"
 DATA_DIR = "dataset/traces"
 SCRIPTS_DIR = "dataset/scripts"
-SANDBOX_RUNNER = "sandbox_runner.py"     # used only when DISABLE_EXECUTION is False
+SANDBOX_RUNNER = "sandbox_runner.py"           # used only when DISABLE_EXECUTION is False
 
 # If deploying publicly, set this env var in Streamlit Cloud: DISABLE_EXECUTION=true
 DISABLE_EXECUTION = os.environ.get("DISABLE_EXECUTION", "false").lower() in ("1", "true", "yes")
 
-# Configure logging to a file (useful for Streamlit Cloud logs)
+# Configure logging (write to a file so logs appear in Streamlit Cloud logs)
 LOGFILE = "app_runtime.log"
 logging.basicConfig(filename=LOGFILE, level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -58,13 +56,12 @@ def _load_model_from_path(path):
         model.eval()
         logging.info(f"Loaded model from {path}")
         return model
-    except Exception as e:
+    except Exception:
         logging.exception("Failed to load model from %s", path)
         return None
 
 def load_model():
     """Try in order: uploaded model (session), then repo model (ae_model.pth)."""
-    # uploaded model (if present) should override repo model
     if os.path.exists(UPLOADED_MODEL_FILENAME):
         m = _load_model_from_path(UPLOADED_MODEL_FILENAME)
         if m is not None:
@@ -129,6 +126,28 @@ def run_sandbox_script(script_path, output_trace="trace.json"):
         logging.info("Sandbox stderr: %s", proc.stderr[:2000])
     return proc
 
+def safe_show_table(title, rows):
+    """
+    Safely render a small table/list of dicts without triggering pyarrow ArrowTypeError.
+    - rows: list of dicts
+    """
+    if not rows:
+        st.info(title + ": No entries to show.")
+        return
+    try:
+        df = pd.DataFrame(rows)
+        # enforce simple types / limited size to avoid pyarrow conversion issues
+        # convert nested lists/dicts to strings
+        for c in df.columns:
+            if df[c].dtype == object:
+                df[c] = df[c].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else x)
+        st.dataframe(df)
+    except Exception:
+        logging.exception("Failed to render anomalous events table")
+        st.write("Could not render table — showing raw items:")
+        for r in rows:
+            st.write(r)
+
 # ---------------------------
 # Streamlit UI
 # ---------------------------
@@ -143,7 +162,6 @@ st.sidebar.header("Model & Environment")
 uploaded_model_file = st.sidebar.file_uploader("Upload ae_model.pth (optional)", type=["pth", "pt"])
 if uploaded_model_file is not None:
     try:
-        # Save uploaded file to workspace and attempt to load
         with open(UPLOADED_MODEL_FILENAME, "wb") as out_f:
             out_f.write(uploaded_model_file.getbuffer())
         st.sidebar.info("Uploaded model saved for this session.")
@@ -185,6 +203,7 @@ if mode == "Dataset Review":
         st.warning("Model not found. Place ae_model.pth in the repo or upload one via sidebar to enable scoring.")
     df = compute_scores_for_dataset(model)
     st.dataframe(df.sort_values(by="score", ascending=False).reset_index(drop=True))
+
     # show distribution where scores exist
     try:
         import plotly.express as px
@@ -287,22 +306,28 @@ elif mode == "Live Analysis":
                                         st.error(f"Verdict: QUARANTINE (score > {suggested:.4f})")
                                     else:
                                         st.success("Verdict: Benign or below threshold")
+
                                     # top anomalous events
-                                    idxs = np.argsort(-losses)[:5] if losses is not None else []
-                                    try:
-                                        with open(trace_out) as f:
-                                            events = json.load(f)
-                                    except Exception:
-                                        events = []
                                     anomalous = []
-                                    for i in idxs:
-                                        if i < len(events):
-                                            anomalous.append({"idx": int(i), "event": events[i].get("event"), "args": events[i].get("args"), "error": float(losses[i])})
+                                    if losses is not None:
+                                        # get top 5 losses indices
+                                        idxs = np.argsort(-losses)[:5]
+                                        try:
+                                            with open(trace_out) as f:
+                                                events = json.load(f)
+                                        except Exception:
+                                            events = []
+                                        for i in idxs:
+                                            if i < len(events):
+                                                anomalous.append({
+                                                    "idx": int(i),
+                                                    "event": events[i].get("event"),
+                                                    "args": events[i].get("args"),
+                                                    "error": float(losses[i])
+                                                })
+                                    # safe display
                                     st.markdown("### Top anomalous events")
-                                    if anomalous:
-                                        st.table(pd.DataFrame(anomalous))
-                                    else:
-                                        st.write("No anomalous events detected or no losses available.")
+                                    safe_show_table("Top anomalous events", anomalous)
                                 else:
                                     st.warning("Score unavailable (scoring error).")
                         else:
@@ -335,21 +360,26 @@ elif mode == "Live Analysis":
                         st.error(f"Verdict: QUARANTINE (score > {suggested:.4f})")
                     else:
                         st.success("Verdict: Benign or below threshold")
-                    try:
-                        with open(trace_path) as f:
-                            events = json.load(f)
-                    except Exception:
-                        events = []
-                    idxs = np.argsort(-losses)[:5] if losses is not None else []
+
+                    # prepare anomalous events list
                     anomalous = []
-                    for i in idxs:
-                        if i < len(events):
-                            anomalous.append({"idx": int(i), "event": events[i].get("event"), "args": events[i].get("args"), "error": float(losses[i])})
+                    if losses is not None:
+                        idxs = np.argsort(-losses)[:5]
+                        try:
+                            with open(trace_path) as f:
+                                events = json.load(f)
+                        except Exception:
+                            events = []
+                        for i in idxs:
+                            if i < len(events):
+                                anomalous.append({
+                                    "idx": int(i),
+                                    "event": events[i].get("event"),
+                                    "args": events[i].get("args"),
+                                    "error": float(losses[i])
+                                })
                     st.markdown("### Top anomalous events")
-                    if anomalous:
-                        st.table(pd.DataFrame(anomalous))
-                    else:
-                        st.write("No anomalous events detected or no losses available.")
+                    safe_show_table("Top anomalous events", anomalous)
 
 # ---------------------------
 # About & Safety Page
