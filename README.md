@@ -1,114 +1,276 @@
-🛡️ BFZDD — Behaviour-First Zero-Day Detector
-AI-powered behavioural anomaly detection for zero-day malware using Python Audit Hooks + LSTM Autoencoders.
-🔥 Overview
+🚀 BFZDD — Behaviour-First Zero-Day Detector
+Runtime Telemetry + LSTM Autoencoders for Zero-Day Malware Detection
 
-BFZDD is a lightweight, behaviour-first malware detection framework designed to identify zero-day attacks without relying on signatures or known malware samples.
-Instead of analyzing file hashes or byte patterns, BFZDD captures runtime behaviour — such as file operations, socket events, and process execution — and uses an LSTM Autoencoder to detect abnormal activity.
+Author: Aditya Kolluru
 
-This makes BFZDD resistant to:
+🧩 Overview
 
-Obfuscation
+BFZDD (Behaviour-First Zero-Day Detector) is an AI-powered, behavior-based malware detection system that identifies zero-day attacks using runtime telemetry instead of static signatures.
 
-Polymorphism
+Traditional antiviruses fail against polymorphic & zero-day malware because they rely on known patterns. BFZDD learns benign program behavior and flags anomalous execution patterns using an LSTM Autoencoder.
 
-AI-generated malware variants
+This system includes:
 
-Unknown attack patterns
+✔ Runtime sandbox using Python Audit Hooks
 
-🧩 Key Features
-✔ Python Audit Hook Sandbox
+✔ Synthetic benign & polymorphic malware generation
+✔ LSTM Autoencoder anomaly detection
+✔ Threshold calibration module
+✔ Advanced visualization dashboard
+✔ Live analysis of traces
+✔ Confusion matrix, ROC curve, event frequency heatmaps
+✔ Trace timeline visualizer
+✔ Model versioning support
+✔ Full cloud deployment (Streamlit)
 
-Captures real-time behaviour: open(), socket, exec, file writes, and more.
+This project is end-to-end, modular, and built to demonstrate industry-grade AI + cybersecurity engineering.
 
-✔ Polymorphic Malware Generator
+🧠 Key Features
+🔒 1. Behaviour-Based Detection
 
-Synthetic adversarial samples used for testing detection robustness.
+Detects malware by observing behavior, not signatures.
 
-✔ LSTM Autoencoder Detection Engine
+📡 2. Runtime Telemetry Capture
 
-Learns benign behaviour and flags anomalies using reconstruction error.
+Using Audit Hooks, BFZDD logs:
 
-✔ Explainability
+file opens, reads, writes
 
-Highlights top anomalous events and computes entropy of written files.
+socket connections
 
-✔ Streamlit Dashboard
+subprocess creation
 
-Interactive UI for dataset review, live sandbox execution, and anomaly scoring.
+file deletion/renaming
 
-✔ VM Safety Guide
+entropy of written files
 
-Ensures safe execution of suspicious code inside an isolated virtual machine.
+🤖 3. LSTM Autoencoder Model
 
-📁 Project Structure
-BFZDD/
+Learns normal behavior → high reconstruction loss signals anomalies.
+
+🧮 4. Threshold Calibration
+
+Calibrates anomaly threshold using benign samples:
+
+suggested_threshold = 99th percentile benign score
+
+📊 5. Full Visualization Suite
+
+Confusion Matrix
+
+Precision / Recall / F1
+
+ROC Curve with AUC
+
+Event Frequency Heatmap
+
+Trace Timeline
+
+Top Anomalous Events
+
+🧪 6. Live Trace Analysis
+
+Upload or select a trace → get:
+
+anomaly score
+
+verdict (OK / QUARANTINE)
+
+detailed anomaly breakdown
+
+💾 7. Model Versioning
+
+Save & load different model versions via versioning.py.
+
+☁️ 8. Cloud Deployment
+
+Runs on Streamlit Cloud with:
+
+automatic model loading
+
+optional user-uploaded .pth
+
+static mode (script execution disabled for safety)
+
+📁 Repository Structure
+├── app.py                      # Streamlit dashboard
+├── model.py                    # LSTM Autoencoder + scoring + trace loader
+├── sandbox_runner.py           # Runtime telemetry capture
+├── dataset_gen.py              # Synthetic dataset generator
+├── polymorphic_gen.py          # Malware generator
+├── train.py                    # Model training code
+├── calibrate_threshold.py      # Threshold computation
+├── utils_viz.py                # ROC, confusion matrix, heatmaps, timelines
+├── versioning.py               # Model version management
 │
-├── app.py                 # Streamlit dashboard
-├── model.py               # AuditAutoencoder + trace loader
-├── sandbox_runner.py      # Python audit-hook sandbox + entropy analysis
-├── calibrate_threshold.py # Threshold calibration for detection
-├── threshold.json         # Saved thresholds (generated)
-├── requirements.txt       # Dependencies
-├── VM_SAFETY.md           # Safety guidelines
-├── README.md              
+├── ae_model.pth                # Trained model (repo-loaded)
+├── threshold.json              # Threshold stats
 │
-└── dataset/
-    ├── traces/
-    │     ├── benign_0.json
-    │     ├── malware_0.json
-    └── scripts/
-          ├── benign_0.py
+├── dataset/
+│   ├── traces/                 # Trace JSON samples
+│   └── scripts/                # Benign & malicious scripts
+│
+├── models/                     # Saved historical models
+├── VM_SAFETY.md                # Sandbox usage safety documentation
+└── README.md
 
-⚙️ Installation
-git clone https://github.com/yourusername/BFZDD.git
-cd BFZDD
-python -m venv venv
-source venv/bin/activate     # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+⚙️ How It Works
+1️⃣ Generate Dataset
+python dataset_gen.py
 
-🧪 Generating Model & Thresholds
-Train model (optional):
+
+Generates:
+
+benign traces
+
+polymorphic malware traces
+
+Stored under dataset/traces/.
+
+2️⃣ Train Model
 python train.py
 
-Calibrate thresholds:
+
+Saves model as:
+
+ae_model.pth
+
+3️⃣ Calibrate Threshold
 python calibrate_threshold.py
 
-🚀 Run the Streamlit Dashboard
+
+Generates:
+
+threshold.json
+
+4️⃣ Launch Dashboard
+
+Local:
+
 streamlit run app.py
 
 
-Runs in your browser at:
+Streamlit Cloud:
+Add repo → Deploy.
 
-http://localhost:8501/
+🖥️ Streamlit Features
+📊 Dataset Review
 
-⚠️ Important Safety Warning
+Score all dataset traces
 
-Running arbitrary scripts executes code.
+Visualize confusion matrix
 
-👉 Always use a virtual machine
-👉 Disable networking
-👉 Follow VM_SAFETY.md carefully
+View Precision / Recall / F1
 
-Never run unknown code directly on your host machine.
+ROC Curve
 
-📊 Results Example
-Sample	Score	Verdict
-benign_0.json	0.41	✔ Normal
-malware_0.json	1.12	🔥 Quarantine
+🔍 Live Analysis
 
-BFZDD successfully separates benign vs unknown-malicious behaviour.
+Upload or choose a trace
 
-🛠️ Future Improvements
+Shows:
 
-Multi-process behaviour graphs (GNN-based detection)
+timeline visualization
 
-Sysmon integration for deeper telemetry
+anomaly score
 
-Cross-platform sandboxing using eBPF
+verdict
 
-Real malware dataset evaluation inside safe lab environments
+top anomalous events
 
-💡 Author
+📈 Tools & Diagnostics
 
-Aditya Kolluru
-B.Tech CSE — Cybersecurity & AI Enthusiast
+Event frequency heatmap
+
+Model version saving/loading
+
+Repo inspection
+
+🔬 Anomaly Detection Logic
+
+Reconstruction loss for each token:
+
+per_token_loss = CrossEntropy(reconstructed, original)
+
+
+Final anomaly score:
+
+anomaly_score = mean(per_token_loss)
+
+
+If anomaly_score > threshold ⇒ malicious.
+
+🧰 Technology Stack
+Layer	Tools
+ML	PyTorch (LSTM Autoencoder)
+Visualization	Plotly, Streamlit
+Runtime Telemetry	Python Audit Hooks
+Deployment	Streamlit Cloud
+Data Handling	JSON, Pandas
+🛡 Security Guidelines
+
+🚫 Never execute unknown scripts on Streamlit Cloud.
+✔ Run malicious scripts ONLY in a Virtual Machine with:
+
+no internet
+
+snapshots enabled
+
+isolated environment
+
+See VM_SAFETY.md for instructions.
+
+📊 Example Outputs
+ROC Curve
+
+Behavior-based separation of benign vs malicious sequences.
+
+Confusion Matrix
+
+Performance evaluation at any threshold.
+
+Trace Timeline
+
+Event-by-event behavioral visualization.
+
+Anomalous Events Table
+
+Pinpoints suspicious behavior tokens.
+
+📢 Why BFZDD Matters
+
+This project demonstrates:
+
+AI for security
+
+sequence modeling
+
+anomaly detection
+
+telemetry processing
+
+real-world cybersecurity engineering
+
+end-to-end full-stack ML pipeline
+
+deployment & visualization
+
+Comparable to the approach used in modern XDR (Extended Detection & Response) systems.
+
+🚀 Future Enhancements
+
+Transformer-based anomaly detector
+
+Graph Neural Networks for behavior graphs
+
+Cuckoo/Firecracker sandbox integration
+
+Real-world malware datasets
+
+Explainable AI for attack attribution
+
+📝 Citation
+
+“Behaviour-First Zero-Day Detector (BFZDD) by Aditya Kolluru (2025)”
+working link : https://iz222gve472hosjdwdeqvu.streamlit.app/
+
