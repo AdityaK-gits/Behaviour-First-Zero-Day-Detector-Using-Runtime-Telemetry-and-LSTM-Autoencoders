@@ -224,3 +224,5 @@ Developer: Aditya Kolluru
 Email: adityakolluru2004@gmail.com
 
 Location: Bengaluru, India
+
+link: https://iz222gve472hosjdwdeqvu.streamlit.app/
