@@ -24,7 +24,6 @@ from io import BytesIO
 import torch
 import torch.nn as nn
 import numpy as np
-import matplotlib.pyplot as plt
 
 # Logging
 print("[APP] start - cwd:", os.getcwd(), "python:", sys.version)
@@ -507,11 +506,14 @@ elif mode == "Fine-Tune Model":
                                 step += 1
                                 progress.progress(int(step / total * 100))
                             loss_history.append(epoch_loss / max(1, len(dl)))
-                            fig, ax = plt.subplots()
-                            ax.plot(loss_history, marker="o")
-                            ax.set_xlabel("Epoch")
-                            ax.set_ylabel("Loss")
-                            loss_ph.pyplot(fig)
+
+                            # Plot training loss with Plotly (replaces matplotlib)
+                            if len(loss_history) > 0:
+                                df_loss = {"epoch": list(range(1, len(loss_history)+1)), "loss": loss_history}
+                                fig_loss = px.line(df_loss, x="epoch", y="loss", markers=True, title="Fine-tune Loss")
+                                fig_loss.update_layout(xaxis_title="Epoch", yaxis_title="Loss")
+                                loss_ph.plotly_chart(fig_loss, use_container_width=True)
+
                         st.success("Fine-tune complete")
                         ts = time.strftime("%Y%m%dT%H%M%S")
                         outname = f"ae_model_{arch}_{ts}.pth"
