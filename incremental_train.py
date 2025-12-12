@@ -1,84 +1,85 @@
-# incremental_train.py
-# Usage:
-#   python incremental_train.py --input retrain_package.zip --model ae_model.pth --outdir models/ --epochs 10 --batch 32 --lr 1e-4
-#
-# This script:
-# - extracts retrain_package.zip (or reads a directory)
-# - loads traces (uploaded + optional replay)
-# - loads ae_model.pth if provided, else initializes model
-# - trains on GPU if available
-# - saves versioned model in outdir and writes threshold.json
+"""
+incremental_train.py
+- Consumes a retrain ZIP (export from app) or directory of traces
+- Supports arch selection: --arch {lstm,gru,transformer}
+- Supports KL regularizer weight (--kl-weight)
+- Saves model to outdir and writes threshold.json
+Usage:
+ python incremental_train.py --input retrain_pkg.zip --arch transformer --model ae_model.pth --outdir models --epochs 20 --batch 64 --lr 1e-4 --kl-weight 0.01 --cuda
+"""
 
-import os
 import argparse
 import zipfile
-import json
 import tempfile
+import shutil
+import os
+import json
+import time
 from pathlib import Path
+
 import torch
 import torch.nn as nn
 import numpy as np
-from model import AuditAutoencoder, load_trace, estimated_vocab_size
 
-def read_traces_from_zip(zip_path, tmpdir):
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(tmpdir)
+from model import build_model, load_trace, estimated_vocab_size, compute_kl_regularizer
+
+def extract_traces_from_zip(zippath, outdir):
+    with zipfile.ZipFile(zippath, "r") as zf:
+        zf.extractall(outdir)
     traces = []
-    # uploaded/ and replay/ paths inside zip
-    for root, dirs, files in os.walk(tmpdir):
+    for root, dirs, files in os.walk(outdir):
         for f in files:
             if f.endswith(".json"):
                 traces.append(os.path.join(root, f))
     return traces
 
-def read_traces_from_dir(dir_path):
+def collect_traces(input_path):
+    p = Path(input_path)
+    tmpdir = None
     traces = []
-    for p in Path(dir_path).rglob("*.json"):
-        traces.append(str(p))
-    return traces
+    if p.is_file() and zipfile.is_zipfile(str(p)):
+        tmpdir = tempfile.mkdtemp(prefix="bfzdd_inc_")
+        traces = extract_traces_from_zip(str(p), tmpdir)
+    elif p.is_dir():
+        for q in p.rglob("*.json"):
+            traces.append(str(q))
+    else:
+        raise ValueError("Input must be a zip file or directory.")
+    return traces, tmpdir
 
 def seq_from_path(p):
     try:
-        seq = load_trace(str(p))
-        if hasattr(seq, "tolist"):
-            seq = seq.tolist()
-        seq = list(seq)
-        seq = [int(x) for x in seq]
-        return seq
-    except Exception as e:
-        print("Failed load_trace:", p, e)
+        s = load_trace(str(p))
+        if hasattr(s, "tolist"):
+            s = s.tolist()
+        s = list(s)
+        s = [int(x) for x in s]
+        return s
+    except Exception:
         return None
 
-def pad_sequences(seqs, pad_value=0):
+def pad_seqs(seqs, pad_value=0):
     maxlen = max(len(s) for s in seqs)
-    arr = np.full((len(seqs), maxlen), pad_value, dtype=np.int64)
+    X = np.full((len(seqs), maxlen), pad_value, dtype=np.int64)
     for i,s in enumerate(seqs):
-        arr[i,:len(s)] = s
-    return torch.LongTensor(arr)
+        X[i,:len(s)] = s
+    return torch.LongTensor(X)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Path to retrain zip or directory with traces")
-    parser.add_argument("--model", default="ae_model.pth", help="Base model (.pth) to fine-tune")
-    parser.add_argument("--outdir", default="models", help="Output directory for new model")
+    parser.add_argument("--input", required=True, help="retrain zip or directory")
+    parser.add_argument("--arch", choices=["lstm","gru","transformer"], default="lstm")
+    parser.add_argument("--model", default="ae_model.pth", help="base model to start from (optional)")
+    parser.add_argument("--outdir", default="models", help="where to save new models")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
+    parser.add_argument("--kl-weight", type=float, default=0.0)
+    parser.add_argument("--cuda", action="store_true", help="use CUDA if available")
     args = parser.parse_args()
 
-    tmpdir = None
-    traces = []
-    if zipfile.is_zipfile(args.input):
-        tmpdir = tempfile.mkdtemp(prefix="bfzdd_retrain_")
-        traces = read_traces_from_zip(args.input, tmpdir)
-    elif Path(args.input).is_dir():
-        traces = read_traces_from_dir(args.input)
-    else:
-        raise ValueError("Input must be a zip file or a directory of traces")
-
-    print(f"Found {len(traces)} trace files")
-
+    traces, tmpdir = collect_traces(args.input)
+    print(f"Found {len(traces)} JSON traces")
     seqs = []
     for t in traces:
         s = seq_from_path(t)
@@ -87,16 +88,17 @@ def main():
     if len(seqs) == 0:
         raise RuntimeError("No valid sequences found")
 
-    vb = estimated_vocab_size() if callable(estimated_vocab_size) else 200
-    model = AuditAutoencoder(vocab_size=vb)
+    print(f"Loaded {len(seqs)} sequences, building model arch={args.arch}")
+    vocab = estimated_vocab_size()
+    model = build_model(args.arch, vocab_size=vocab)
     if Path(args.model).exists():
         print("Loading base model:", args.model)
-        state = torch.load(args.model, map_location="cpu")
+        sd = torch.load(args.model, map_location="cpu")
         try:
-            model.load_state_dict(state)
+            model.load_state_dict(sd)
         except Exception:
             ms = model.state_dict()
-            for k,v in state.items():
+            for k,v in sd.items():
                 if k in ms and ms[k].shape == v.shape:
                     ms[k] = v
             model.load_state_dict(ms)
@@ -105,57 +107,64 @@ def main():
     model.to(device)
     model.train()
 
-    X = pad_sequences(seqs)
-    dataset = torch.utils.data.TensorDataset(X)
-    dl = torch.utils.data.DataLoader(dataset, batch_size=args.batch, shuffle=True)
-
+    X = pad_seqs(seqs)
+    ds = torch.utils.data.TensorDataset(X)
+    dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, shuffle=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=0)
 
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         for batch in dl:
-            batch_x = batch[0].to(device).long()
+            bx = batch[0].to(device).long()
             opt.zero_grad()
-            logits = model(batch_x)
+            logits = model(bx)
             B,T,V = logits.size()
-            loss = criterion(logits.view(-1,V), batch_x.view(-1))
+            loss = criterion(logits.view(-1,V), bx.view(-1))
+            if args.kl_weight and args.kl_weight > 0:
+                kl = compute_kl_regularizer(logits.detach())
+                loss = loss + args.kl_weight * kl
             loss.backward()
             opt.step()
-            epoch_loss += loss.item()
-        print(f"Epoch {epoch+1}/{args.epochs} loss={epoch_loss/len(dl):.6f}")
+            epoch_loss += float(loss.item())
+        print(f"Epoch {epoch+1}/{args.epochs} loss={epoch_loss/max(1,len(dl)):.6f}")
 
-    # save model
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%dT%H%M%S")
-    outpath = outdir / f"ae_model_finetuned_{ts}.pth"
+    outname = f"ae_finetuned_{args.arch}_{ts}.pth"
+    outpath = outdir / outname
     torch.save(model.state_dict(), str(outpath))
-    print("Saved fine-tuned model to", outpath)
+    # metadata
+    meta = {"arch": args.arch, "vocab_size": vocab, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    with open(str(outpath)+".meta.json", "w") as fh:
+        json.dump(meta, fh, indent=2)
+    print("Saved fine-tuned model:", outpath)
 
-    # threshold calibration: compute mean per-sample recon loss and write threshold.json
+    # threshold calibration
     model.eval()
-    benign_scores = []
+    scores = []
     with torch.no_grad():
         for s in seqs:
             x = torch.LongTensor([s]).to(device)
             out = model(x)
             B,T,V = out.size()
-            losses = nn.CrossEntropyLoss(reduction="none", ignore_index=0)(out.view(-1,V), x.view(-1))
-            benign_scores.append(float(losses.mean().item()))
-    p95 = float(np.percentile(benign_scores, 95))
-    p99 = float(np.percentile(benign_scores, 99))
-    mean_score = float(np.mean(benign_scores))
-    std_score = float(np.std(benign_scores))
-    threshold = {"mean": mean_score, "std": std_score, "p95": p95, "p99": p99, "suggested_threshold": p99}
-    with open("threshold.json", "w") as fh:
-        json.dump(threshold, fh, indent=2)
-    print("Wrote threshold.json (suggested_threshold=p99)")
+            losses = nn.CrossEntropyLoss(reduction="none", ignore_index=0)(out.view(-1,V), x.view(-1)).cpu().numpy().reshape(B,T)[0]
+            valid = [float(x) for (x,t) in zip(losses, x.cpu().numpy()[0]) if int(t)!=0]
+            if valid:
+                scores.append(float(np.mean(valid)))
+    if len(scores) > 0:
+        p95 = float(np.percentile(scores, 95))
+        p99 = float(np.percentile(scores, 99))
+        mean = float(np.mean(scores))
+        std = float(np.std(scores))
+        threshold = {"mean": mean, "std": std, "p95": p95, "p99": p99, "suggested_threshold": p99}
+        with open("threshold.json", "w") as fh:
+            json.dump(threshold, fh, indent=2)
+        print("Wrote threshold.json (suggested_threshold=p99)")
 
-    # cleanup tempdir if created
     if tmpdir:
         shutil.rmtree(tmpdir)
-        print("Removed temporary dir", tmpdir)
 
 if __name__ == "__main__":
     main()
